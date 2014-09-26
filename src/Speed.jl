@@ -7,7 +7,7 @@ import Base.Meta.isexpr
 
 # this will always be written as the first element of the file
 # to check for version changes
-VERSION = 1
+VERSION = 5
 
 global ispoisoned = Set{Module}()
 global modtimes = Dict{String,Float64}()
@@ -72,9 +72,11 @@ function include(filename::String)
             local cache
             try
                 cache = open(cache_path,"r")
-                if ((deserialize(cache) != VERSION) ||
-                    (deserialize(cache)::Float64 != path_mtime) ||
-                    (deserialize(cache)::Float64 != get(modtimes, prev, 0.0)))
+                header = deserialize(cache)
+                if (!isa(header,Tuple) ||
+                    (header[1] != VERSION) ||
+                    (header[2] != path_mtime) ||
+                    (header[3] != get(modtimes, prev, 0.0)))
                     close(cache)
                     fail = true
                     poison!(cm)
@@ -96,6 +98,10 @@ function include(filename::String)
                     lno = (c::LineNumberNode).line
                 elseif Meta.isexpr(c,:line)
                     lno = c.args[1]
+                elseif isexpr(c, :compressed_module)
+                    eval(cm, Expr(:module, c.args[1], c.args[2], quote
+                        $module_body($(c.args[2]), $(QuoteNode(c)))
+                    end))
                 else
                     res = eval(cm, c)
                 end
@@ -106,17 +112,18 @@ function include(filename::String)
             code = parse("quote $(readall(path)) end").value
             rename(code, symbol(path))
             f = IOBuffer()
-            serialize(f, VERSION)
-            serialize(f, path_mtime)
-            serialize(f, prev === nothing ? 0.0 : mtime(prev))
-            for c in code.args
-                if isa(c,LineNumberNode)
-                    lno = (c::LineNumberNode).line
-                elseif Meta.isexpr(c,:line)
-                    lno = c.args[1]
-                else
-                    c = expand(c)
+            serialize(f, (VERSION, path_mtime, prev === nothing ? 0.0 : mtime(prev)))
+            for ex in code.args
+                if isa(ex,LineNumberNode)
+                    lno = (ex::LineNumberNode).line
+                    serialize(f, ex)
+                    continue
+                elseif Meta.isexpr(ex,:line)
+                    lno = ex.args[1]
+                    serialize(f, ex)
+                    continue
                 end
+                c = expand(ex)
                 if isexpr(c, :const)
                     c2 = c.args[1]
                     isconst = true
@@ -139,6 +146,11 @@ function include(filename::String)
                         end
                     end
                     serialize(f, c)
+                elseif isexpr(c, :module) && length(c.args) == 3 &&
+                        isexpr(c.args[3], :block) && isa(c.args[2],Symbol) && isa(c.args[1],Bool)
+                    res = eval(cm, Expr(:module, c.args[1], c.args[2], quote
+                        $module_body($f, $(c.args[2]), $(QuoteNode(c)))
+                    end))
                 else
                     serialize(f, c)
                     res = eval(cm, c)
@@ -163,6 +175,37 @@ function include(filename::String)
         delete!(modtimes, path)
     end
     return res
+end
+
+function module_body(f1, mod, m) # serialize
+    f = IOBuffer()
+    res = nothing
+    for ex in m.args[3].args
+        if isa(ex,LineNumberNode)
+            lno = (ex::LineNumberNode).line
+            serialize(f, ex)
+            continue
+        elseif Meta.isexpr(ex,:line)
+            lno = ex.args[1]
+            serialize(f, ex)
+            continue
+        end
+        c = expand(ex)
+        serialize(f, c)
+        res = Core.eval(mod, Expr(:toplevel,c))
+    end
+    serialize(f1, Expr(:compressed_module, m.args[1], m.args[2], takebuf_array(f)))
+    res
+end
+
+function module_body(mod, m) # deserialize
+    f = IOBuffer(m.args[3])
+    res = nothing
+    while !eof(f)
+        c = deserialize(f)
+        res = Core.eval(mod, Expr(:toplevel,c))
+    end
+    res
 end
 
 rename(::ANY, fname::Symbol) = nothing
