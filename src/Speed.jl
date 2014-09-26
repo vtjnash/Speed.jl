@@ -1,6 +1,13 @@
 module Speed
+
 export include
+# public functions are @Speed.upper, Speed.poison!([::Module]), Speed.include()
+
 import Base.Meta.isexpr
+
+# this will always be written as the first element of the file
+# to check for version changes
+VERSION = 0
 
 global ispoisoned = Set{Module}()
 global modtimes = Dict{String,Float64}()
@@ -14,7 +21,7 @@ end
 
 macro upper()
     quote
-        prev = Base.source_path(nothing)
+        prev = abspath(Base.source_path(nothing))
         if prev !== nothing
             modtimes[prev] = mtime(prev)
         end
@@ -26,13 +33,13 @@ function include(filename::String)
     myid() == 1 || return Base.include(filename) # remote handler is not implemented
 
     prev = Base.source_path(nothing)
-    path = (prev === nothing) ? abspath(filename) : joinpath(dirname(prev),filename)
+    path = abspath(prev === nothing ? filename : joinpath(dirname(prev),filename))
     tls = task_local_storage()
     tls[:SOURCE_PATH] = path
 
     local c = nothing, lno::Int = 0, res = nothing
     try
-        cache_path = string(path,"c")
+        cache_path = string(path,'c',Base.ser_version::Int)
         cm = current_module()
         isfile(path) || error("could not open file $path")
         path_mtime = mtime(path)::Float64
@@ -44,10 +51,9 @@ function include(filename::String)
             poison!(cm)
         else
             cache = open(cache_path,"r")
-            cache_mtime = deserialize(cache)::Float64
-            prev_mtime = deserialize(cache)::Float64
-            if ((cache_mtime != path_mtime) ||
-                (get(modtimes, prev, 0.0) != prev_mtime))
+            if ((deserialize(cache) != VERSION) ||
+                (deserialize(cache)::Float64 != path_mtime) ||
+                (deserialize(cache)::Float64 != get(modtimes, prev, 0.0)))
                 close(cache)
                 fail = true
                 poison!(cm)
@@ -73,6 +79,7 @@ function include(filename::String)
             code = parse("quote $(readall(path)) end").value
             rename(code, symbol(path))
             open(cache_path,"w") do f
+                serialize(f, VERSION)
                 serialize(f, path_mtime)
                 serialize(f, prev === nothing ? 0.0 : mtime(prev))
                 for c in code.args
