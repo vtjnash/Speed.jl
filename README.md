@@ -5,7 +5,9 @@
 
 ## Usage
 
- * `using Speed`
+    using Speed
+    @Speed.upper
+
 
 ## Caution
 

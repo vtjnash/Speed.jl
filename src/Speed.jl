@@ -1,33 +1,80 @@
 module Speed
 export include
 import Base.Meta.isexpr
+
+global ispoisoned = Set{Module}()
+global modtimes = Dict{String,Float64}()
+function __init__()
+    empty!(ispoisoned)
+    empty!(modtimes)
+end
+function poison!(m::Module=current_module())
+    push!(ispoisoned,m)
+end
+
+macro upper()
+    quote
+        prev = Base.source_path(nothing)
+        if prev !== nothing
+            modtimes[prev] = mtime(prev)
+        end
+    end
+end
+
 function include(filename::String)
+    global ispoisoned
+    myid() == 1 || return Base.include(filename) # remote handler is not implemented
+
     prev = Base.source_path(nothing)
-    path = (prev == nothing) ? abspath(filename) : joinpath(dirname(prev),filename)
+    path = (prev === nothing) ? abspath(filename) : joinpath(dirname(prev),filename)
     tls = task_local_storage()
     tls[:SOURCE_PATH] = path
 
-    cache_path = string(path,"c")
-    cm = current_module()
-    local c = nothing, lno::Int = 0
+    local c = nothing, lno::Int = 0, res = nothing
     try
-        if isfile(cache_path)
-            open(cache_path,"r") do f
-                while !eof(f)
-                    c = deserialize(f)
-                    if isa(c,LineNumberNode)
-                        lno = (c::LineNumberNode).line
-                    elseif Meta.isexpr(c,:line)
-                        lno = c.args[1]
-                    else
-                        eval(cm, c)
-                    end
+        cache_path = string(path,"c")
+        cm = current_module()
+        isfile(path) || error("could not open file $path")
+        path_mtime = mtime(path)::Float64
+        modtimes[path] = path_mtime
+        if cm in ispoisoned
+            fail = true
+        elseif !isfile(cache_path)
+            fail = true
+            poison!(cm)
+        else
+            cache = open(cache_path,"r")
+            cache_mtime = deserialize(cache)::Float64
+            prev_mtime = deserialize(cache)::Float64
+            if ((cache_mtime != path_mtime) ||
+                (get(modtimes, prev, 0.0) != prev_mtime))
+                close(cache)
+                fail = true
+                poison!(cm)
+            else
+                fail = false
+            end
+        end
+        if !fail
+            f = cache::IOStream
+            while !eof(f)
+                c = deserialize(f)
+                if isa(c,LineNumberNode)
+                    lno = (c::LineNumberNode).line
+                elseif Meta.isexpr(c,:line)
+                    lno = c.args[1]
+                else
+                    res = eval(cm, c)
                 end
             end
+            close(f)
         else
+            #println("cache miss $path")
             code = parse("quote $(readall(path)) end").value
             rename(code, symbol(path))
             open(cache_path,"w") do f
+                serialize(f, path_mtime)
+                serialize(f, prev === nothing ? 0.0 : mtime(prev))
                 for c in code.args
                     if isa(c,LineNumberNode)
                         lno = (c::LineNumberNode).line
@@ -60,7 +107,7 @@ function include(filename::String)
                         serialize(f, c)
                     else
                         serialize(f, c)
-                        eval(cm, c)
+                        res = eval(cm, c)
                     end
                 end
             end
@@ -73,8 +120,9 @@ function include(filename::String)
         else
             tls[:SOURCE_PATH] = prev
         end
+        delete!(modtimes, path)
     end
-    
+    return res
 end
 
 rename(::ANY, fname::Symbol) = nothing
@@ -89,4 +137,5 @@ function rename(e::Expr, fname::Symbol)
         end
     end
 end
+
 end
