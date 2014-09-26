@@ -7,7 +7,7 @@ import Base.Meta.isexpr
 
 # this will always be written as the first element of the file
 # to check for version changes
-VERSION = 0
+VERSION = 1
 
 global ispoisoned = Set{Module}()
 global modtimes = Dict{String,Float64}()
@@ -28,6 +28,24 @@ macro upper()
     end
 end
 
+#### THIS CODE WORKS AROUND A BUG IN BASE
+# https://github.com/JuliaLang/julia/pull/4896
+# https://github.com/JuliaLang/julia/issues/308
+_replace_dict{T<:Dict}(dest::T, src::T) = ccall(:memcpy, Ptr{Void}, (Ptr{T}, Ptr{T}, Int), &dest, &src, sizeof(src))
+const _old_known_lambda_data = Dict()
+const _new_known_lambda_data = Dict()
+function deserialize(f)
+    empty!(_new_known_lambda_data)
+    _replace_dict(_old_known_lambda_data, Base.known_lambda_data)
+    _replace_dict(Base.known_lambda_data, _new_known_lambda_data)
+    try
+        return Base.deserialize(f)
+    finally
+        _replace_dict(Base.known_lambda_data, _old_known_lambda_data)
+    end
+end
+####
+
 function include(filename::String)
     global ispoisoned
     myid() == 1 || return Base.include(filename) # remote handler is not implemented
@@ -37,7 +55,8 @@ function include(filename::String)
     tls = task_local_storage()
     tls[:SOURCE_PATH] = path
 
-    local c = nothing, lno::Int = 0, res = nothing
+    local c = nothing
+    local lno::Int = 0, res = nothing
     try
         cache_path = string(path,'c',Base.ser_version::Int)
         cm = current_module()
@@ -50,15 +69,23 @@ function include(filename::String)
             fail = true
             poison!(cm)
         else
-            cache = open(cache_path,"r")
-            if ((deserialize(cache) != VERSION) ||
-                (deserialize(cache)::Float64 != path_mtime) ||
-                (deserialize(cache)::Float64 != get(modtimes, prev, 0.0)))
-                close(cache)
+            local cache
+            try
+                cache = open(cache_path,"r")
+                if ((deserialize(cache) != VERSION) ||
+                    (deserialize(cache)::Float64 != path_mtime) ||
+                    (deserialize(cache)::Float64 != get(modtimes, prev, 0.0)))
+                    close(cache)
+                    fail = true
+                    poison!(cm)
+                else
+                    fail = false
+                end
+            catch e
+                try close(cache) end
                 fail = true
                 poison!(cm)
-            else
-                fail = false
+                warn(e, prefix="Speed.jl WARNING: ", bt=catch_backtrace())
             end
         end
         if !fail
@@ -78,45 +105,51 @@ function include(filename::String)
             #println("cache miss $path")
             code = parse("quote $(readall(path)) end").value
             rename(code, symbol(path))
-            open(cache_path,"w") do f
-                serialize(f, VERSION)
-                serialize(f, path_mtime)
-                serialize(f, prev === nothing ? 0.0 : mtime(prev))
-                for c in code.args
-                    if isa(c,LineNumberNode)
-                        lno = (c::LineNumberNode).line
-                    elseif Meta.isexpr(c,:line)
-                        lno = c.args[1]
-                    else
-                        c = macroexpand(c)
-                    end
-                    if isexpr(c, :const)
-                        c2 = c.args[1]
-                        isconst = true
-                    else
-                        c2 = c
-                        isconst = false
-                    end
-                    if isexpr(c2, :(=)) && is(c2.args[1],Expr) && c2.args[1].head !== :call
-                        #for "a = b", but not "a() = b", try to pre-evaluate b
-                        try
-                            res = eval(cm, c)
-                        catch
-                            serialize(f,c)
-                            rethrow()
-                        end
-                        if !isa(res,Ptr)
-                            c2 = Expr(c2.head, c2.args[1], res)
-                            if isconst
-                                c = Expr(:const, c2)
-                            end
-                        end
-                        serialize(f, c)
-                    else
-                        serialize(f, c)
-                        res = eval(cm, c)
-                    end
+            f = IOBuffer()
+            serialize(f, VERSION)
+            serialize(f, path_mtime)
+            serialize(f, prev === nothing ? 0.0 : mtime(prev))
+            for c in code.args
+                if isa(c,LineNumberNode)
+                    lno = (c::LineNumberNode).line
+                elseif Meta.isexpr(c,:line)
+                    lno = c.args[1]
+                else
+                    c = expand(c)
                 end
+                if isexpr(c, :const)
+                    c2 = c.args[1]
+                    isconst = true
+                else
+                    c2 = c
+                    isconst = false
+                end
+                if isexpr(c2, :(=)) && is(c2.args[1],Expr) && c2.args[1].head !== :call
+                    #for "a = b", but not "a() = b", try to pre-evaluate b
+                    try
+                        res = eval(cm, c)
+                    catch
+                        serialize(f, c)
+                        rethrow()
+                    end
+                    if !isa(res,Ptr)
+                        c2 = Expr(c2.head, c2.args[1], res)
+                        if isconst
+                            c = Expr(:const, c2)
+                        end
+                    end
+                    serialize(f, c)
+                else
+                    serialize(f, c)
+                    res = eval(cm, c)
+                end
+            end
+            try
+                cache = open(cache_path,"w")
+                write(cache, takebuf_array(f))
+                close(cache)
+            catch e
+                warn(e, prefix="Speed.jl WARNING: ", bt=catch_backtrace())
             end
         end
     catch e
