@@ -7,7 +7,7 @@ import Base.Meta.isexpr
 
 # this will always be written as the first element of the file
 # to check for version changes
-VERSION = 5
+VERSION = 6
 
 global ispoisoned = Set{Module}()
 global modtimes = Dict{String,Float64}()
@@ -58,7 +58,7 @@ function include(filename::String)
     local c = nothing
     local lno::Int = 0, res = nothing
     try
-        cache_path = string(path,'c',Base.ser_version::Int)
+        cache_path = string(path,'c')
         cm = current_module()
         isfile(path) || error("could not open file $path")
         path_mtime = mtime(path)::Float64
@@ -72,16 +72,25 @@ function include(filename::String)
             local cache
             try
                 cache = open(cache_path,"r")
-                header = deserialize(cache)
-                if (!isa(header,Tuple) ||
-                    (header[1] != VERSION) ||
-                    (header[2] != path_mtime) ||
-                    (header[3] != get(modtimes, prev, 0.0)))
+                if ((read(cache, Int64) != WORD_SIZE) ||
+                    (read(cache, Int64) != Base.ser_version))
                     close(cache)
                     fail = true
-                    poison!(cm)
+                    poisen!(cm)
                 else
-                    fail = false
+                    header = deserialize(cache)
+                    if (!isa(header,Tuple) ||
+                        length(header) != 4 ||
+                        (header[1] != OS_NAME) ||
+                        (header[2] != VERSION) ||
+                        (header[3] != path_mtime) ||
+                        (header[4] != get(modtimes, prev, 0.0)))
+                        close(cache)
+                        fail = true
+                        poison!(cm)
+                    else
+                        fail = false
+                    end
                 end
             catch e
                 try close(cache) end
@@ -112,7 +121,9 @@ function include(filename::String)
             code = parse("quote $(readall(path)) end").value
             rename(code, symbol(path))
             f = IOBuffer()
-            serialize(f, (VERSION, path_mtime, prev === nothing ? 0.0 : mtime(prev)))
+            write(f, int64(WORD_SIZE))
+            write(f, int64(Base.ser_version))
+            serialize(f, (Sys.OS_NAME, VERSION, path_mtime, prev === nothing ? 0.0 : mtime(prev)))
             for ex in code.args
                 if isa(ex,LineNumberNode)
                     lno = (ex::LineNumberNode).line
