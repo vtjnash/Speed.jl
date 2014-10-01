@@ -1,7 +1,7 @@
 module Speed
 
 export include
-# public functions are @Speed.upper, Speed.poison!([::Module]), Speed.include()
+# public functions are @Speed.upper, Speed.poison!([::Symbol]), Speed.include()
 
 import Base.Meta.isexpr
 
@@ -9,15 +9,18 @@ import Base.Meta.isexpr
 # to check for version changes
 VERSION = 6
 
-global ispoisoned = Set{Module}()
+global poisoned = Set{(Symbol...)}()
 global modtimes = Dict{String,Float64}()
 function __init__()
-    empty!(ispoisoned)
+    empty!(poisoned)
     empty!(modtimes)
 end
-function poison!(m::Module=current_module())
-    push!(ispoisoned,m)
-end
+poison!(m::Module=current_module()) = push!(poisoned,fullname(m))
+poison!(s::Symbol) = push!(poisoned,(s,))
+poison!(s::(Symbol...)) = push!(poisoned,s)
+ispoisoned(m::Module=current_module()) = ispoisoned(fullname(m))
+ispoisoned(s::Symbol) = ispoisoned((s,))
+ispoisoned(s::(Symbol...)) = s in poisoned
 
 macro upper()
     quote
@@ -47,7 +50,6 @@ end
 ####
 
 function include(filename::String)
-    global ispoisoned
     myid() == 1 || return Base.include(filename) # remote handler is not implemented
 
     prev = Base.source_path(nothing)
@@ -63,7 +65,7 @@ function include(filename::String)
         isfile(path) || error("could not open file $path")
         path_mtime = mtime(path)::Float64
         modtimes[path] = path_mtime
-        if cm in ispoisoned
+        if ispoisoned(cm)
             fail = true
         elseif !isfile(cache_path)
             fail = true
